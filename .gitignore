@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Models (downloaded at runtime — too large for git)
+models/
+*.onnx
+*.onnx.json
+
+# Env & secrets
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
