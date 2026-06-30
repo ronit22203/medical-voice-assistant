@@ -1,0 +1,147 @@
+# =============================================================================
+# Medical Voice Assistant — Baseline Configuration
+# =============================================================================
+# This file is the single source of truth for the demo pipeline.
+# Clinical parameters (silence budgets, prosody rules, prompt directives)
+# will live in config/agents/, config/silence_budgets.yaml, etc.
+# This file stays clean: hardware, model endpoints, VAD tuning, audio I/O.
+
+meta:
+  name: "baseline-mva-m4"
+  description: "Local Whisper + Llama 3.1 8B + Piper. Echo-gated, think-stripped."
+  target_device: "MacBook Air M4 / 16 GB"
+  last_tuned: "2026-06-30"
+
+# -----------------------------------------------------------------------------
+# Audio I/O — sample rates must match what the models actually expect
+# -----------------------------------------------------------------------------
+audio:
+  input:
+    sample_rate: 16000      # Whisper native rate; no resampling penalty
+    channels: 1             # Mono microphone
+    chunk_size: 1024        # Samples per read; smaller = lower latency, higher CPU
+    device_index: null      # null = system default; set to int for specific mic
+
+  output:
+    sample_rate: 22050      # Piper lessac-medium outputs 22050 Hz natively
+    channels: 1
+    buffer_duration_ms: 200 # Pre-buffer before playback to avoid underruns
+
+# -----------------------------------------------------------------------------
+# Voice Activity Detection — tuned for medical conversation, not call center
+# -----------------------------------------------------------------------------
+vad:
+  confidence: 0.5           # Silero speech probability threshold (0.0–1.0)
+                            #   0.5: balanced precision/recall
+                            #   Raise to 0.7 if false triggers on background noise
+  min_volume: 0.3           # EBU R128 loudness gate (0.0–1.0)
+                            #   Discards frames quieter than this fraction of max
+                            #   0.3: whisper-level speech passes, keyboard clicks don't
+  start_secs: 0.2           # Speech must persist this long before VAD fires START
+                            #   0.2: catches short acknowledgments ("yes", "no")
+                            #   NOTE: clinical version will increase this per question type
+  stop_secs: 0.8            # Silence must persist this long before VAD fires STOP
+                            #   0.8: standard conversational turn boundary
+                            #   NOTE: this is the GLOBAL default
+                            #   Clinical override lives in config/silence_budgets.yaml
+                            #   (factual recall ~4s, emotional disclosure ~7s, SI ~12s)
+  min_speech_duration_ms: 100  # Ignore bursts shorter than this (clicks, pops)
+  min_silence_duration_ms: 100 # Ignore gaps shorter than this (hesitation breaths)
+                               #   Clinical: keep this low to detect micro-pauses
+                               #   for prosody analysis and disclosure hesitancy
+
+# -----------------------------------------------------------------------------
+# Speech-to-Text — Whisper via faster-whisper
+# -----------------------------------------------------------------------------
+stt:
+  model: medium             # tiny / base / small / medium / large
+                            #   medium: best balance of accuracy vs. speed on M4
+                            #   large-v3: better medical vocab, 2× slower, needs ~3 GB
+  device: cpu               # cpu | cuda | auto
+                            #   faster-whisper on M4 uses CPU + Accelerate; GPU via CoreML
+                            #   coming in whisper.cpp integration
+  compute_type: int8        # int8 | int8_float16 | float16 | float32
+                            #   int8: fastest, smallest memory, negligible accuracy loss
+  language: en              # Pre-specify to avoid auto-detection latency
+  beam_size: 5              # Beam search width; 5 is default, 1 for speed
+  best_of: 5                # Candidates in beam search
+  vad_filter: false         # Whisper's internal VAD; we use Silero upstream
+  # Medical vocabulary injection (for mva — not active in baseline)
+  # vocab_boost:
+  #   enabled: false
+  #   terms_file: "config/medical_terms.txt"
+
+# -----------------------------------------------------------------------------
+# Large Language Model — OpenAI-compatible API (local LM Studio / llama.cpp)
+# -----------------------------------------------------------------------------
+llm:
+  provider: lm_studio       # lm_studio | llama_cpp | ollama | openai
+  base_url: "http://localhost:1234/v1"
+  api_key: "lm-studio"      # LM Studio's default; no real auth needed locally
+  model: "meta-llama-3.1-8b-instruct"
+  # Parameters
+  temperature: 0.7          # 0.0 = deterministic, 1.0 = creative
+                            #   Clinical: will drop to 0.3 for safety-sensitive turns
+  max_tokens: 256           # Cap response length for voice (2-4 spoken sentences)
+  top_p: 0.95
+  frequency_penalty: 0.0
+  presence_penalty: 0.0
+  # Streaming
+  stream: true              # Required for ThinkStripper to work
+  stream_chunk_ms: 50       # How often tokens are emitted during streaming
+  # Context
+  context_window: 4096      # Enough for multi-turn conversation + system prompt
+  # Safety (loaded from config/prompts.yaml in clinical version)
+  # system_prompt: "..."
+
+# -----------------------------------------------------------------------------
+# Text-to-Speech — Piper (local)
+# -----------------------------------------------------------------------------
+tts:
+  engine: piper             # piper | styletss2 (future)
+  voice: "en_US-lessac-medium"
+  # Quality settings
+  length_scale: 1.0         # 1.0 = default speed; <1.0 faster, >1.0 slower
+  noise_scale: 0.667        # Variability in pitch/energy; 0.667 is Piper default
+  noise_w: 0.8              # Phoneme duration variability
+  # Deliberate pause (clinical feature — not active in baseline)
+  # post_llm_pause_ms: 350  # Silence inserted before TTS to signal thoughtfulness
+  # Audio device
+  speaker_device_index: null  # null = system default
+
+# -----------------------------------------------------------------------------
+# Pipeline — Pipecat orchestration
+# -----------------------------------------------------------------------------
+pipeline:
+  # Processor ordering is defined in main.py; this section is for tunables
+  echo_gate:
+    enabled: true           # Drop mic input while bot is speaking
+    release_ms: 100         # Extra delay after BotStoppedSpeaking before opening mic
+
+  mic_monitor:
+    enabled: true
+    log_every_n_frames: 50  # Print volume bar every N frames
+
+  frame_tracer:
+    enabled: true
+    skip_audio_frames: true # Don't flood logs with raw audio bytes
+
+  think_stripper:
+    enabled: true           # Strip <think>...</think> from reasoning models
+    # If using a non-reasoning model (like base Llama 3.1), this is a no-op
+
+# -----------------------------------------------------------------------------
+# System Prompt — baseline empathetic medical voice assistant
+# -----------------------------------------------------------------------------
+system_prompt: |
+  You are a warm, attentive medical voice assistant speaking directly with a patient.
+
+  Guidelines:
+  - Speak in short, clear sentences suitable for voice.
+  - Use plain language; avoid medical jargon unless the patient uses it first.
+  - Validate the patient's concerns before asking questions.
+  - If the patient expresses distress, acknowledge it before moving forward.
+  - Do NOT diagnose. Your role is to listen, gather information, and provide support.
+  - If asked for emergency advice, direct the patient to call emergency services immediately.
+
+  You are speaking at conversational speed. Keep responses under 3 sentences unless the patient asks for detail.

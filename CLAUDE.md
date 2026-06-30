@@ -13,36 +13,41 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Requires macOS 15+ on Apple Silicon and Python 3.11+. LLM inference depends on a running [LM Studio](https://lmstudio.ai) instance at `http://localhost:1234/v1` serving a compatible model (default config targets `meta-llama-3.1-8b-instruct`).
+Requires macOS 15+ on Apple Silicon and Python 3.11+. LLM inference requires a running [LM Studio](https://lmstudio.ai) instance at `http://localhost:1234/v1` with a model loaded. The Piper voice model (`.onnx`) is **not** checked in — download `en_US-lessac-medium.onnx` and its `.onnx.json` sidecar and place them in the repo root (or wherever Piper resolves the voice name).
 
 ## Running
 
 ```bash
-# Minimal working pipeline (example.py)
 python example.py
-
-# Full agent with silence budgets and prosody gating (target entrypoint, not yet built)
-python run_agent.py --profile clinician_empathetic
 ```
+
+All tunable parameters live in `config/settings.yaml`. Edit that file to swap models, adjust VAD thresholds, or change the system prompt — no Python changes needed. The `meta.name` / `meta.notes` fields are printed at startup to self-document runs.
 
 ## Architecture
 
-The pipeline is a sequential Pipecat chain:
+`example.py` is the single working entrypoint. It builds a sequential Pipecat 1.4.0 pipeline:
 
 ```
-Mic → Silero VAD → Whisper STT → LLM (via OpenAI-compat API) → Piper TTS → Speaker
+Mic → EchoGate → MicMonitor → VADProcessor → WhisperSTT → LLMContextAggregator
+    → OpenAILLM → ThinkStripper → PiperTTS → Speaker → LLMContextAggregator
 ```
 
-`example.py` is the working baseline. The planned production layout lives under `src/mva/` (described in `README.md`) and is not yet implemented.
+**Non-obvious wiring decisions learned the hard way:**
 
-Key architectural decisions:
-- **Silence budgets** are per-question-type (factual: 4.5s, emotional: 7s, suicide screening: 12s), not global. Defined in `config/silence_budgets.yaml` (planned).
-- **Prosody gating** runs openSMILE/SpeechBrain on a 500ms sliding window and injects a clinical qualifier (`[DISTRESS]`, `[FLAT_AFFECT]`, `[DISCLOSURE_HESITANCY]`) into the LLM system prompt before each response.
-- **Deliberate post-LLM pause** (default 350ms) is intentional, not pipeline lag — it signals the patient their words registered.
-- **LLM is accessed via OpenAI-compatible API** pointed at localhost, so swapping the local model (BioMistral, Llama-3.1-8B, Meditron) requires only changing the model ID in the config.
-- The Piper voice model (`en_US-lessac-medium.onnx`) is checked into the repo.
+- **VAD is a standalone `VADProcessor`**, not a parameter of `LocalAudioTransport`. `LocalAudioTransportParams` has no `vad_analyzer` field — passing one there is silently ignored by Pydantic. The STT service listens for `VADUserStartedSpeakingFrame` / `VADUserStoppedSpeakingFrame`, which only `VADProcessor` emits.
+- **`FrameProcessor` subclasses must call `await super().process_frame(frame, direction)` before `await self.push_frame(...)`**. The base class sets an internal `__started` flag on `StartFrame`; without it, `push_frame` silently drops every frame.
+- **Sample rates must be set explicitly**: Whisper expects 16 kHz in, Piper `en_US-lessac-medium` outputs 22050 Hz. Mismatching produces sped-up/garbled audio.
+- **`EchoGate`** drops `InputAudioRawFrame` while `BotStartedSpeakingFrame` is active. Without it, the speaker output is picked up by the mic, VAD fires, and `InterruptionFrame` cuts TTS mid-sentence.
+- **`ThinkStripper`** sits between LLM and TTS. Reasoning models (Qwen, DeepSeek-R1) stream `<think>...</think>` tokens before the answer; this processor buffers until `</think>` then forwards only the post-block text. Non-reasoning models pass through immediately on the first token.
+- **`LLMContextAggregatorPair`** returns two processors: `user_aggregator` goes before the LLM, `assistant_aggregator` goes after `transport.output()` at the end of the pipeline.
+
+## Configuration (`config/settings.yaml`)
+
+All fields map 1:1 to constructor arguments in `example.py`. The `vad` block is unpacked directly with `VADParams(**cfg["vad"])`, so adding or removing fields there must stay in sync with `VADParams`'s field names.
 
 ## Planned Module Map (`src/mva/`)
+
+Not yet implemented. Described in `README.md`. The planned production layout includes:
 
 | Module | Role |
 |--------|------|
